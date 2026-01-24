@@ -1,0 +1,5 @@
+include LICENSE
+include README.md
+include CONTRIBUTORS.md
+recursive-include docs *.md *.png
+recursive-include nales/data *.fits

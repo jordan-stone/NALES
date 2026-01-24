@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.conda/
+
+# IDE
+.idea/
+.vscode/
+
+# Vim
+*.swp
+*.swo
+*~
+*.un~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# FITS files (usually too large for git)
+*.fits
+*.fits.gz
+
+# Exception: bundled data files
+!nales/data/bpm.fits
+
+# Output directories
+cubes/
+preprocessed/
+calibration_output/

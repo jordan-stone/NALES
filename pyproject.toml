@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nales"
+version = "1.0.0"
+description = "LBTI/ALES Integral Field Spectrograph Data Reduction Pipeline"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Jordan Stone", email = "3971752+jordan-stone@users.noreply.github.com"}
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.7",
+    "astropy>=5.0",
+    "matplotlib>=3.5",
+    "jfits>=1.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/jordan-stone/nales"
+
+[tool.setuptools]
+packages = ["nales", "nales.utils", "nales.analysis", "nales.data"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"nales.data" = ["*.fits"]
