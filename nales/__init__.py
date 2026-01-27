@@ -83,8 +83,10 @@ from nales.utils.bad_pixels import (
     get_bpm,
 )
 
-# Analysis tools
-from nales.analysis.pca import PCA, parallel_annular_PCA
+# Analysis module (pyKLIP integration requires pyklip - optional dependency)
+# Import the submodule but don't import its contents to avoid
+# requiring pyklip for basic nales usage
+from nales import analysis
 
 # Public API
 __all__ = [
@@ -108,7 +110,6 @@ __all__ = [
     "find_neighbors",
     "correct_with_precomputed_neighbors",
     "get_bpm",
-    # Analysis
-    "PCA",
-    "parallel_annular_PCA",
+    # Analysis (pyKLIP integration)
+    "analysis",
 ]

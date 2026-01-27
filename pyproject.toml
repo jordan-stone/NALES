@@ -20,6 +20,11 @@ dependencies = [
     "jfits>=1.0.0",
 ]
 
+[project.optional-dependencies]
+pyklip = [
+    "pyklip>=2.9",
+]
+
 [project.urls]
 Repository = "https://github.com/jordan-stone/nales"
 

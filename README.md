@@ -21,6 +21,7 @@
   - [Step 2: Build the Median Sky](#step-2-build-the-median-sky)
   - [Step 3: Build the Cubifier](#step-3-build-the-cubifier)
   - [Step 4: Extract Cubes](#step-4-extract-cubes)
+- [High-Contrast Imaging with pyKLIP](#high-contrast-imaging-with-pyklip)
 - [Key Concepts](#key-concepts)
 - [API Reference](#api-reference)
 - [Diagnostic Tools](#diagnostic-tools)
@@ -37,7 +38,7 @@ nales ("new ALES") is a Python package for reducing data from **ALES** (Arizona 
 
 ALES provides high-contrast imaging spectroscopy at thermal infrared wavelengths (2.9-4.1 μm) with R~70 over a 2" square field of view. The instrument uses a lenslet array to sample the diffraction-limited PSF, producing a grid of microspectra on the detector.
 
-This package transforms raw 2D detector images into calibrated 3D spectral cubes (wavelength × spatial × spatial).
+This package transforms raw 2D detector images into calibrated 3D spectral cubes (wavelength × spatial × spatial), and provides integration with [pyKLIP](https://pyklip.readthedocs.io/) for PSF subtraction and flux-calibrated spectral extraction.
 
 ---
 
@@ -54,12 +55,20 @@ cd nales
 pip install -e .
 ```
 
-### Basic Installation
+### Installing from the Development Branch
+
+To install the latest development version with new features (including pyKLIP analysis support):
 
 ```bash
 git clone https://github.com/jordan-stone/nales.git
 cd nales
+git checkout development
+
+# Basic installation (data reduction only)
 pip install -e .
+
+# Or, include pyKLIP for high-contrast imaging analysis
+pip install -e ".[pyklip]"
 ```
 
 ### Verify Installation
@@ -69,17 +78,25 @@ import nales
 print(nales.__version__)
 from nales import Cubifier, SkyBuilder, CubeExtractor
 print("nales installed successfully!")
+
+# Check if pyklip support is available
+from nales.analysis import is_pyklip_available
+print(f"pyKLIP available: {is_pyklip_available()}")
 ```
 
 ### Dependencies
 
-The following dependencies are automatically installed by `pip install -e .` if not already present:
+Core dependencies (installed automatically):
 
 - NumPy >= 1.20
 - SciPy >= 1.7
 - Astropy >= 5.0
 - Matplotlib >= 3.5
 - [jfits](https://pypi.org/project/jfits/) >= 1.0.0
+
+Optional dependencies:
+
+- [pyklip](https://pyklip.readthedocs.io/) >= 2.9 (for high-contrast imaging analysis)
 
 ---
 
@@ -217,60 +234,132 @@ with open('science_target/Cubifier.pkl', 'wb') as f:
 
 ### Step 4: Extract Cubes
 
-Use `CubeExtractor` for batch processing. For each science frame, this:
-- Applies correlated double sampling (CDS) and overscan correction
-- Median-combines the N closest-in-time sky frames for background subtraction
-- Corrects bad pixels using pre-computed neighbor interpolation
-- Extracts the spectral cube using the Cubifier's wavelength solution
+Use `CubeExtractor` for batch processing:
 
 ```python
 extractor = nales.CubeExtractor(
-    cubifier='science_target/Cubifier.pkl',
-    frame_ids='science_target/target_frames.pkl',
-    bad_pixel_file='wavecal/bad_and_neighbors_bpm_and_these_darks.pkl',
-    raw_directory='science_target/raw/'
+    cubifier=cubifier,
+    sky_builder=builder,
+    bad_pixel_file='wavecal/bad_and_neighbors_bpm_and_these_darks.pkl'
 )
-
 extractor.run(output_dir='cubes/', n_sky_frames=50)
 ```
 
-Output:
-- `cubes/cube_*.fits` - Extracted spectral cubes with wavelength table
-- `cubes/bfsscdsp_*.fits` - Preprocessed 2D frames (sky-subtracted, bad-pixel corrected)
-
-#### Single Frame Extraction
+For large datasets, split into preprocessing and cubification:
 
 ```python
-cube, wavelengths = cubifier(science_frame)
-# cube.shape: (n_wavelengths, 63, 67)
-```
-
-#### Flexure Tracking
-
-For multiple calibrations per night, you can preprocess once and re-cubify with different Cubifiers. The preprocessing steps (CDS, sky subtraction, bad pixel correction) are saved, allowing re-extraction without repeating them:
-
-```python
-# Preprocess once
 extractor.preprocess_only(output_dir='preprocessed/', n_sky_frames=50)
-
-# Re-cubify with different Cubifiers
-extractor.cubify_preprocessed('preprocessed/', output_dir='cubes_v1/')
-
-extractor2 = nales.CubeExtractor(cubifier='Cubifier_v2.pkl')
-extractor2.cubify_preprocessed('preprocessed/', output_dir='cubes_v2/')
+extractor.cubify_preprocessed(input_dir='preprocessed/', output_dir='cubes/')
 ```
+
+---
+
+## High-Contrast Imaging with pyKLIP
+
+nales includes integration with [pyKLIP](https://pyklip.readthedocs.io/) for high-contrast imaging analysis. This enables PSF subtraction using KLIP (Karhunen-Loève Image Processing), forward-model spectral extraction, and flux calibration to physical units.
+
+### Quick Start
+
+```python
+from nales.analysis import ALESData
+
+# Load reduced datacubes
+dataset = ALESData('cubes/cube_*.fits', highpass=True)
+print(dataset)
+
+# Generate PSFs for forward modeling
+# Option 1: From auxiliary calibrator (exposure times read from headers)
+dataset.generate_psfs(
+    aux_psf_files='calibrator/cal_cube.fits',
+    normalize='none'      # Keep DN for flux calibration
+)
+
+# Option 2: From central star in science frames
+dataset.generate_psfs(normalize='none')
+
+# Set up flux calibration using stellar model + WISE W1 photometry
+dataset.compute_dn_per_contrast(W1_mag=5.23, spectral_type='G2V')
+
+# Run KLIP
+import pyklip.parallelized as parallelized
+parallelized.klip_dataset(
+    dataset,
+    outputdir='klip_output/',
+    fileprefix='target',
+    annuli=9,
+    subsections=4,
+    movement=1,
+    numbasis=[1, 5, 10, 20, 50],
+    mode='ADI+SDI'
+)
+
+# After KLIP-FM spectral extraction:
+planet_flux = dataset.calibrate_contrast_spectrum(contrast_spectrum)
+# planet_flux is now in Jy
+```
+
+### PSF Centroiding Options
+
+The `generate_psfs()` function supports multiple centroiding methods:
+
+```python
+# 2D Gaussian fit (default, best for point sources)
+dataset.generate_psfs(centroid_method='gaussian')
+
+# Center of mass
+dataset.generate_psfs(centroid_method='com')
+
+# Peak pixel location
+dataset.generate_psfs(centroid_method='peak')
+
+# Radon transform (best for diffraction spikes, uses pyklip)
+dataset.generate_psfs(centroid_method='radon')
+```
+
+The `'radon'` method uses pyKLIP's implementation of the Radon transform algorithm from [Pueyo et al. (2015)](https://ui.adsabs.harvard.edu/abs/2015ApJ...803...31P), which finds the stellar center by maximizing flux along diffraction spike angles. This is particularly useful for coronagraphic data.
+
+### Flux Calibration
+
+The flux calibration workflow converts KLIP-extracted contrast spectra to physical flux units:
+
+1. **PSF in DN**: Raw detector counts preserving chromatic throughput
+2. **Stellar model**: Pickles library spectrum scaled to WISE W1 photometry
+3. **dn_per_contrast**: Conversion factor = PSF_flux / stellar_model_flux
+4. **Planet flux**: contrast × stellar_model_flux
+
+```python
+# The stellar model is automatically retrieved and scaled
+dataset.compute_dn_per_contrast(
+    W1_mag=5.23,           # WISE W1 magnitude (look up on SIMBAD/VizieR)
+    spectral_type='G2V',   # Spectral type for Pickles model
+    output_units='Jy'      # or 'W/m2/um'
+)
+
+# Access the stellar model for reference
+import matplotlib.pyplot as plt
+plt.plot(dataset.stellar_model_wvs, dataset.stellar_model_flux)
+plt.xlabel('Wavelength (μm)')
+plt.ylabel('Flux (Jy)')
+```
+
+### Further Reading
+
+- [pyKLIP Documentation](https://pyklip.readthedocs.io/)
+- [pyKLIP CHARIS Tutorial](https://pyklip.readthedocs.io/en/latest/instruments/CHARIS.html) (similar IFS workflow)
+- [KLIP Algorithm Paper](https://ui.adsabs.harvard.edu/abs/2012ApJ...755L..28S) (Soummer et al. 2012)
+- [Forward Modeling Paper](https://ui.adsabs.harvard.edu/abs/2016ApJ...824..117P) (Pueyo 2016)
 
 ---
 
 ## Key Concepts
 
-### Lenslet IFS Principle
+### Cube Structure
 
-ALES uses a lenslet array in the focal plane. Each lenslet samples a spatial region ("spaxel") and creates a point source dispersed by a prism. The detector image contains a grid of microspectra that must be extracted and reorganized into a 3D datacube.
+Output cubes have shape `(n_wavelengths, n_rows, n_cols)` where:
+- `n_wavelengths` = 99 spectral channels (2.9-4.1 μm)
+- `n_rows` × `n_cols` = 63 × 67 spatial pixels (default)
 
-### Wavelength Calibration
-
-Four narrow-band filters (NB29, NB33, NB35, NB39 at 2.9, 3.3, 3.5, 3.9 μm) provide wavelength calibration. Each filter creates spots at known positions within microspectra, enabling wavelength solution construction.
+Wavelengths are stored in a binary table extension (HDU 1) with column `WAVELENGTH` in microns.
 
 ### Light Leak Correction
 
@@ -349,13 +438,45 @@ extractor.preprocess_only(output_dir, n_sky_frames=50)
 extractor.cubify_preprocessed(input_dir, output_dir)
 ```
 
+### Analysis (requires pyklip)
+
+```python
+from nales.analysis import ALESData
+
+dataset = ALESData(
+    filepaths,         # Glob pattern or list of FITS files
+    highpass=False,    # Apply high-pass filter
+    skipslices=None,   # Wavelength indices to skip
+    IWA=0,             # Inner working angle (pixels)
+    OWA=None,          # Outer working angle (pixels, default=image size/2)
+)
+
+dataset.generate_psfs(
+    boxrad=10,                    # Half-width of PSF stamp
+    aux_psf_files=None,           # Auxiliary calibrator file(s)
+    aux_exptime=None,             # Calibrator exposure time
+    sci_exptime=None,             # Science exposure time
+    normalize='none',             # 'none', 'per_channel', or 'cube'
+    centroid_method='gaussian',   # 'gaussian', 'com', 'peak', or 'radon'
+)
+
+dataset.compute_dn_per_contrast(
+    W1_mag,                       # WISE W1 magnitude
+    spectral_type=None,           # e.g., 'G2V'
+    Teff=None,                    # Alternative to spectral_type
+    output_units='Jy',            # 'Jy' or 'W/m2/um'
+)
+
+planet_flux = dataset.calibrate_contrast_spectrum(contrast_spectrum)
+```
+
 ### Utility Modules
 
 - `nales.utils.wavecal` - Wavelength calibration (spot grids, fitting)
 - `nales.utils.bad_pixels` - Bad pixel detection and correction
 - `nales.utils.rotation` - Image rotation and trace angles
 - `nales.utils.registration` - Sub-pixel image registration
-- `nales.analysis.pca` - Annular PCA for post-processing
+- `nales.analysis` - High-contrast imaging with pyKLIP (ALESData, PSF generation, flux calibration)
 
 ---
 
@@ -446,6 +567,16 @@ plt.ion()
 
 ALES produces large cubes. Ensure 16GB+ RAM and use `CubeExtractor` for batch processing with chunked memory management. For `SkyBuilder.build_median_sky()`, reduce `chunk_size` (e.g., 256 or 512) to limit memory usage.
 
+### pyKLIP Not Found
+
+If you get `ImportError` when using the analysis module:
+
+```bash
+pip install pyklip
+# or reinstall nales with pyklip support:
+pip install -e ".[pyklip]"
+```
+
 ---
 
 ## Acknowledgments
@@ -453,6 +584,10 @@ ALES produces large cubes. Ensure 16GB+ RAM and use `CubeExtractor` for batch pr
 nales includes code developed collaboratively with the MEAD pipeline. The sub-pixel registration and spot-spoofing algorithms were extended by Zackery Briesemeister for MEAD and incorporated back into nales. We thank Zack for his contributions.
 
 See: Briesemeister et al. 2018, Proc. SPIE, 10702, 107022Q
+
+The analysis module uses [pyKLIP](https://pyklip.readthedocs.io/) for PSF subtraction and forward modeling. If you use the pyKLIP integration, please also cite pyKLIP:
+
+> Wang, J. J., Ruffio, J.-B., De Rosa, R. J., et al. 2015, Astrophysics Source Code Library, ascl:1506.001
 
 ---
 
