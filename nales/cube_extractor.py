@@ -23,7 +23,7 @@ class CubeExtractor:
     1. Loading a pre-built Cubifier
     2. For each science frame, finding temporally-close sky frames
     3. Building and subtracting a running sky background
-    4. Applying preprocessing (CDS+, bad pixel correction)
+    4. Applying preprocessing (CDS+ or slope fitting, bad pixel correction)
     5. Extracting spectral cubes
     6. Saving with proper FITS headers and wavelength table
     
@@ -44,6 +44,18 @@ class CubeExtractor:
     raw_directory : str, optional
         Directory containing raw FITS files. If None, uses paths from
         frame_ids directly.
+    method : str, optional
+        Ramp collapse method passed to do_cds_plus. Default: 'cds'
+        - 'cds': Correlated double sampling (last read - first read).
+        - 'slopes': Fit a slope to all reads specified by read_stride,
+          reducing read noise and enabling cosmic ray rejection.
+    read_stride : int, optional
+        Stride between non-destructive reads to load from each ramp.
+        Read 0 (the reset read) is always included. Default: -1
+        When method='cds', this is ignored and only reads (0, -1)
+        are loaded.
+        When method='slopes', this must be set to a positive integer.
+        Reads are loaded as [0, stride, 2*stride, ...].
         
     Attributes
     ----------
@@ -61,6 +73,10 @@ class CubeExtractor:
         Parallactic angles of science frames.
     bad_and_neighbors : list
         Pre-computed bad pixel correction data.
+    method : str
+        Ramp collapse method ('cds' or 'slopes').
+    read_stride : int
+        Stride between reads.
         
     Examples
     --------
@@ -79,6 +95,17 @@ class CubeExtractor:
     ... )
     >>> 
     >>> # Run full pipeline
+    >>> extractor.run(output_dir='cubes/', n_sky_frames=50)
+    
+    Using slope fitting:
+    
+    >>> extractor = CubeExtractor(
+    ...     cubifier='Cuber.pkl',
+    ...     frame_ids=frame_ids,
+    ...     bad_pixel_file='bad_and_neighbors.pkl',
+    ...     method='slopes',
+    ...     read_stride=1,
+    ... )
     >>> extractor.run(output_dir='cubes/', n_sky_frames=50)
     
     Preprocessing only (for flexure tracking):
@@ -110,7 +137,19 @@ class CubeExtractor:
         frame_ids=None,
         bad_pixel_file=None,
         raw_directory=None,
+        method='cds',
+        read_stride=-1,
     ):
+        if method == 'slopes' and read_stride == -1:
+            raise ValueError(
+                "read_stride must be a positive integer when method='slopes'. "
+                "Set read_stride=1 to use all reads, or e.g. read_stride=2 "
+                "to use every other read."
+            )
+
+        self.method = method
+        self.read_stride = read_stride
+
         # Load cubifier if path provided
         if isinstance(cubifier, str):
             print(f"Loading Cubifier from {cubifier}")
@@ -149,13 +188,54 @@ class CubeExtractor:
         else:
             self.bad_and_neighbors = None
             
+    def _get_use_reads(self, n_reads_total):
+        """
+        Determine which read indices to load based on method and read_stride.
+
+        Parameters
+        ----------
+        n_reads_total : int
+            Total number of reads in the raw ramp.
+
+        Returns
+        -------
+        use_reads : tuple
+            Indices into the read axis to load from disk.
+        """
+        if self.method == 'cds':
+            return (0, -1)
+        else:
+            return tuple(range(0, n_reads_total, self.read_stride))
+
+    def _apply_stride_correction(self, image):
+        """
+        Scale slope-fitted output to CDS-equivalent units when read_stride > 1.
+
+        _fit_ramp_slopes assumes reads are spaced by 1 and scales output
+        to slope * (n_steps - 1). The actual span in read units is
+        (n_steps - 1) * read_stride, so we multiply by read_stride to
+        recover CDS-equivalent DN.
+
+        Parameters
+        ----------
+        image : numpy.ndarray
+            2D preprocessed image from do_cds_plus.
+
+        Returns
+        -------
+        image : numpy.ndarray
+            Corrected image (modified in place if stride > 1).
+        """
+        if self.method == 'slopes' and self.read_stride > 1:
+            image = image * self.read_stride
+        return image
+
     def run(
         self,
         output_dir='cubes/',
         n_sky_frames=50,
         save_preprocessed=True,
         preprocessed_dir=None,
-        use_reads=(0, -1),
         overwrite=False,
     ):
         """
@@ -169,14 +249,12 @@ class CubeExtractor:
             Number of closest sky frames to use for background.
             Default: 50
         save_preprocessed : bool, optional
-            If True, also save the preprocessed (sky-subtracted, CDS+)
+            If True, also save the preprocessed (sky-subtracted)
             2D images. Useful for re-cubifying with different Cubifiers.
             Default: True
         preprocessed_dir : str, optional
             Directory for preprocessed files. If None and save_preprocessed
             is True, uses output_dir. Default: None
-        use_reads : tuple, optional
-            Which reads to use from the ramp. Default: (0, -1)
         overwrite : bool, optional
             If True, overwrite existing files. Default: False
         """
@@ -194,6 +272,7 @@ class CubeExtractor:
             
         print(f"Processing {len(self.primary_files)} science frames...")
         print(f"Using {n_sky_frames} closest sky frames for each")
+        print(f"Ramp collapse method: {self.method}")
         
         # Track last sky indices for potential reuse
         last_sky_inds = None
@@ -218,6 +297,8 @@ class CubeExtractor:
             # Load science frame
             with fits.open(filepath) as hdu:
                 header = hdu[0].header
+                n_reads_total = hdu[0].data.shape[0]
+                use_reads = self._get_use_reads(n_reads_total)
                 data = hdu[0].data[use_reads, :, :]
                 
             # Find closest sky frames
@@ -239,11 +320,13 @@ class CubeExtractor:
             # Sky subtraction
             data_sky_sub = data - sky_median
             
-            # CDS+ processing
+            # Ramp collapse and preprocessing
             preprocessed = do_cds_plus(
                 data_sky_sub, 
-                bad_and_neighbors=self.bad_and_neighbors
+                bad_and_neighbors=self.bad_and_neighbors,
+                method=self.method,
             )
+            preprocessed = self._apply_stride_correction(preprocessed)
             
             # Save preprocessed if requested
             if save_preprocessed:
@@ -268,7 +351,6 @@ class CubeExtractor:
         self,
         output_dir='preprocessed/',
         n_sky_frames=50,
-        use_reads=(0, -1),
         overwrite=False,
     ):
         """
@@ -283,8 +365,6 @@ class CubeExtractor:
             Directory for preprocessed files. Default: 'preprocessed/'
         n_sky_frames : int, optional
             Number of closest sky frames for background. Default: 50
-        use_reads : tuple, optional
-            Which reads to use from the ramp. Default: (0, -1)
         overwrite : bool, optional
             If True, overwrite existing files. Default: False
         """
@@ -296,6 +376,7 @@ class CubeExtractor:
         os.makedirs(output_dir, exist_ok=True)
         
         print(f"Preprocessing {len(self.primary_files)} science frames...")
+        print(f"Ramp collapse method: {self.method}")
         
         last_sky_inds = None
         last_sky_median = None
@@ -319,6 +400,8 @@ class CubeExtractor:
             # Load science frame
             with fits.open(filepath) as hdu:
                 header = hdu[0].header
+                n_reads_total = hdu[0].data.shape[0]
+                use_reads = self._get_use_reads(n_reads_total)
                 data = hdu[0].data[use_reads, :, :]
                 
             # Find closest sky frames
@@ -337,12 +420,14 @@ class CubeExtractor:
                 last_sky_inds = sky_inds
                 last_sky_median = sky_median
                 
-            # Sky subtraction and CDS+
+            # Sky subtraction and ramp collapse
             data_sky_sub = data - sky_median
             preprocessed = do_cds_plus(
                 data_sky_sub,
-                bad_and_neighbors=self.bad_and_neighbors
+                bad_and_neighbors=self.bad_and_neighbors,
+                method=self.method,
             )
+            preprocessed = self._apply_stride_correction(preprocessed)
             
             # Save
             self._save_preprocessed(preprocessed, header, sky_files, output_file)
@@ -360,7 +445,8 @@ class CubeExtractor:
         Extract cubes from existing preprocessed files.
         
         Use this when re-cubifying with a different Cubifier (e.g., for
-        flexure tracking).
+        flexure tracking). This method does not use method or read_stride
+        since the input files are already preprocessed 2D images.
         
         Parameters
         ----------
@@ -435,10 +521,11 @@ class CubeExtractor:
         n_sky_frames=50,
         output_cube=None,
         output_preprocessed=None,
-        use_reads=(0, -1),
     ):
         """
         Extract a cube from a single science frame.
+        
+        Uses the method and read_stride set at construction time.
         
         Parameters
         ----------
@@ -453,8 +540,6 @@ class CubeExtractor:
             Path for output cube. If None, cube is not saved.
         output_preprocessed : str, optional
             Path for preprocessed file. If None, not saved.
-        use_reads : tuple, optional
-            Which reads to use. Default: (0, -1)
             
         Returns
         -------
@@ -466,6 +551,8 @@ class CubeExtractor:
         # Load science frame
         with fits.open(science_file) as hdu:
             header = hdu[0].header
+            n_reads_total = hdu[0].data.shape[0]
+            use_reads = self._get_use_reads(n_reads_total)
             data = hdu[0].data[use_reads, :, :]
             
         # Get sky files
@@ -485,8 +572,10 @@ class CubeExtractor:
         data_sky_sub = data - sky_median
         preprocessed = do_cds_plus(
             data_sky_sub,
-            bad_and_neighbors=self.bad_and_neighbors
+            bad_and_neighbors=self.bad_and_neighbors,
+            method=self.method,
         )
+        preprocessed = self._apply_stride_correction(preprocessed)
         
         # Save preprocessed if requested
         if output_preprocessed is not None:

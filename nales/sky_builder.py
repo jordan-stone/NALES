@@ -236,14 +236,15 @@ class SkyBuilder:
         light_leak_scale=1.0,
         output='median_sky.fits',
         chunk_size=512,
-        use_reads=(0, -1),
+        read_stride=-1,
+        method='cds',
     ):
         """
         Build a median sky image from identified sky frames.
-        
+
         Uses memory-efficient chunked processing to handle large datasets
         that don't fit in memory.
-        
+
         Parameters
         ----------
         dark_file : str, optional
@@ -261,15 +262,26 @@ class SkyBuilder:
             Size of image chunks for memory-efficient processing.
             The image is processed in chunk_size x chunk_size tiles.
             Default: 512
-        use_reads : tuple, optional
-            Which reads to use from the ramp, as indices.
-            Default: (0, -1) for first and last reads (CDS).
-            
+        read_stride : int, optional
+            Stride between non-destructive reads to load from each ramp.
+            Read 0 (the reset read) is always included. Default: -1
+            When method='cds', this is ignored and only reads (0, -1)
+            are loaded.
+            When method='slopes', this must be set to a positive integer.
+            Reads are loaded as [0, stride, 2*stride, ...]. Consider
+            reducing chunk_size when using a small stride (many reads),
+            as per-chunk memory scales with the number of reads loaded.
+        method : str, optional
+            Ramp collapse method passed to do_cds_plus. Default: 'cds'
+            - 'cds': Correlated double sampling (last read - first read).
+            - 'slopes': Fit a slope to all reads, reducing read noise
+              and enabling cosmic ray rejection.
+
         Returns
         -------
         median_sky : numpy.ndarray
-            2D median sky image after CDS+ processing.
-            
+            2D median sky image after preprocessing.
+
         Notes
         -----
         The processing steps are:
@@ -277,108 +289,122 @@ class SkyBuilder:
         2. Compute the median along the frame axis
         3. Reassemble the full image from chunks
         4. Subtract median dark (if provided)
-        5. Apply CDS+ processing (correlated double sampling + bad pixel fix)
+        5. Apply CDS+ or slope fitting, overscan correction, and bad
+           pixel correction
         6. Subtract light leak (if provided)
         """
+        if method == 'slopes' and read_stride == -1:
+            raise ValueError(
+                "read_stride must be a positive integer when method='slopes'. "
+                "Set read_stride=1 to use all reads, or e.g. read_stride=2 "
+                "to use every other read."
+            )
+
         if self.sky_files is None or len(self.sky_files) == 0:
             raise ValueError(
                 "No sky frames identified. Run identify_frames() first."
             )
-            
+
         print(f"Building median sky from {len(self.sky_files)} frames...")
-        
+
         # Load dark if provided
         med_dark = None
         if dark_file is not None:
             print(f"Loading dark: {dark_file}")
             med_dark = fits.getdata(dark_file)
-            
+
         # Load bad pixel corrections if provided
         bad_and_neighbors = None
         if bad_pixel_file is not None:
             print(f"Loading bad pixel file: {bad_pixel_file}")
             with open(bad_pixel_file, 'rb') as f:
                 bad_and_neighbors = pickle.load(f)
-                
+
         # Load light leak if provided
         light_leak = None
         if light_leak_file is not None:
             print(f"Loading light leak: {light_leak_file}")
             light_leak = fits.getdata(light_leak_file) * light_leak_scale
-            
+
         # Determine image dimensions from first file
         with fits.open(self.sky_files[0]) as hdu:
             data_shape = hdu[0].data.shape
-            
-        # Handle different data shapes
+
+        # Determine which reads to load
         if len(data_shape) == 3:
-            n_reads, ny, nx = data_shape
+            n_reads_total = data_shape[0]
+            ny, nx = data_shape[1], data_shape[2]
+
+            if method == 'cds':
+                use_reads = (0, -1)
+            else:
+                use_reads = tuple(range(0, n_reads_total, read_stride))
+
             n_use_reads = len(use_reads)
         else:
             ny, nx = data_shape
             n_use_reads = 1
             use_reads = None
-            
+
         print(f"Image size: {ny} x {nx}, using {n_use_reads} reads")
-        
+
         # Calculate number of chunks
         n_chunks_y = int(np.ceil(ny / chunk_size))
         n_chunks_x = int(np.ceil(nx / chunk_size))
-        
+
         # Initialize output array
         if use_reads is not None:
             whole_arr = np.empty((n_use_reads, ny, nx))
         else:
             whole_arr = np.empty((ny, nx))
-            
+
         # Process in chunks for memory efficiency
         print(f"Processing in {n_chunks_y}x{n_chunks_x} chunks of {chunk_size}x{chunk_size}...")
-        
+
         for ky in range(n_chunks_y):
             for kx in range(n_chunks_x):
                 y_start = ky * chunk_size
                 y_end = min((ky + 1) * chunk_size, ny)
                 x_start = kx * chunk_size
                 x_end = min((kx + 1) * chunk_size, nx)
-                
+
                 chunk_ny = y_end - y_start
                 chunk_nx = x_end - x_start
-                
+
                 print(f"  Chunk ({ky}, {kx}): [{y_start}:{y_end}, {x_start}:{x_end}]")
-                
+
                 # Allocate array for this chunk across all frames
                 if use_reads is not None:
                     chunk_arr = np.empty((len(self.sky_files), n_use_reads, chunk_ny, chunk_nx))
                 else:
                     chunk_arr = np.empty((len(self.sky_files), chunk_ny, chunk_nx))
-                    
+
                 # Load chunk from each sky frame
                 for ii, sky_file in enumerate(self.sky_files):
-                    # Handle path: use basename if raw_directory differs
                     if self.raw_directory != self.data_directory:
                         basename = os.path.basename(sky_file)
                         filepath = os.path.join(self.raw_directory, basename)
                     else:
                         filepath = sky_file
-                        
+
                     with fits.open(filepath) as hdu:
                         if use_reads is not None:
                             chunk_arr[ii] = hdu[0].data[use_reads, y_start:y_end, x_start:x_end]
                         else:
                             chunk_arr[ii] = hdu[0].data[y_start:y_end, x_start:x_end]
-                            
+
                 # Compute median for this chunk
                 med_chunk = np.median(chunk_arr, axis=0)
-                
+
                 if use_reads is not None:
                     whole_arr[:, y_start:y_end, x_start:x_end] = med_chunk
                 else:
                     whole_arr[y_start:y_end, x_start:x_end] = med_chunk
-                    
+
                 # Free memory
                 del chunk_arr
                 gc.collect()
-                
+
         # Apply dark subtraction
         if med_dark is not None:
             print("Subtracting dark...")
@@ -386,22 +412,27 @@ class SkyBuilder:
                 whole_arr = whole_arr - med_dark[use_reads, :, :]
             else:
                 whole_arr = whole_arr - med_dark
-                
-        # Apply CDS+ processing
-        print("Applying CDS+ processing...")
-        out = do_cds_plus(whole_arr, bad_and_neighbors=bad_and_neighbors)
-        
+
+        # Apply CDS+ or slope fitting
+        print(f"Applying ramp collapse (method={method})...")
+        out = do_cds_plus(whole_arr, bad_and_neighbors=bad_and_neighbors,
+                          method=method)
+
+        # Correct for read stride in slope fitting output.
+        # _fit_ramp_slopes assumes reads are spaced by 1 and scales output
+        # to slope * (n_steps - 1). The actual span in read units is
+        # (n_steps - 1) * read_stride, so we multiply by read_stride to
+        # recover CDS-equivalent DN.
+        if method == 'slopes' and read_stride > 1:
+            out = out * read_stride
+
         # Apply light leak correction
         if light_leak is not None:
             print("Subtracting light leak...")
             out = out - light_leak
-            
+
         # Save result
         print(f"Saving to {output}...")
-        fits.writeto(output, out, overwrite=True)
-        print(f"Median sky complete: {output}")
-        
-        return out
         
     def get_closest_sky_frames(self, timestamp, n_closest=20):
         """

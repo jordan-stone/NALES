@@ -22,6 +22,10 @@
   - [Step 3: Build the Cubifier](#step-3-build-the-cubifier)
   - [Step 4: Extract Cubes](#step-4-extract-cubes)
 - [Key Concepts](#key-concepts)
+  - [Lenslet IFS Principle](#lenslet-ifs-principle)
+  - [Wavelength Calibration](#wavelength-calibration)
+  - [Light Leak Correction](#light-leak-correction)
+  - [Ramp Collapse: CDS vs. Slope Fitting](#ramp-collapse-cds-vs-slope-fitting)
 - [API Reference](#api-reference)
 - [Diagnostic Tools](#diagnostic-tools)
 - [Troubleshooting](#troubleshooting)
@@ -129,11 +133,18 @@ import nales
 wave_cal_ims, light_leak = nales.organize_wavecal_frames('raw/')
 ```
 
+By default this uses correlated double sampling (CDS), which subtracts the first non-destructive read from the last. To instead fit slopes to all reads in the ramp, reducing read noise and enabling cosmic ray rejection:
+
+```python
+wave_cal_ims, light_leak = nales.organize_wavecal_frames('raw/', method='slopes')
+```
+
 This automatically:
 - Sorts files by filter and exposure time
 - Creates median darks
 - Dark-subtracts narrow-band images
-- Applies CDS+ and bad pixel corrections
+- Collapses the ramp at each pixel (CDS or slope fitting)
+- Applies overscan and bad pixel corrections
 - Computes and subtracts light leak
 - Saves `light_leak_median.fits` for use with sky frames
 
@@ -168,7 +179,22 @@ median_sky = builder.build_median_sky(
 )
 ```
 
-**Memory note:** The `chunk_size` parameter controls memory usage during median combination. With `chunk_size=2048` (full frame), combining 400 images can use 60+ GB of RAM. Use smaller values (512, 256) on systems with limited memory. The value must divide evenly into 2048.
+To use slope fitting for the sky, pass `method` and `read_stride`:
+
+```python
+median_sky = builder.build_median_sky(
+    dark_file='wavecal/darks/median_XXXX.XX.fits',
+    bad_pixel_file='wavecal/bad_and_neighbors_bpm_and_these_darks.pkl',
+    light_leak_file='wavecal/light_leak_median.fits',
+    light_leak_scale=1.0,
+    method='slopes',
+    read_stride=1,    # Use every read; set to 2 for every other read, etc.
+    chunk_size=256,   # Reduce chunk_size when loading many reads
+    output='science_target/median_sky.fits'
+)
+```
+
+**Memory note:** The `chunk_size` parameter controls memory usage during median combination. With `chunk_size=2048` (full frame), combining 400 images can use 60+ GB of RAM. Use smaller values (512, 256) on systems with limited memory. The value must divide evenly into 2048. When using `method='slopes'`, more reads are loaded per frame, further increasing memory usage — reduce `chunk_size` accordingly.
 
 <p align="center">
   <img src="docs/images/medianSky.png" alt="Median Sky Full Frame" width="400">
@@ -218,9 +244,9 @@ with open('science_target/Cubifier.pkl', 'wb') as f:
 ### Step 4: Extract Cubes
 
 Use `CubeExtractor` for batch processing. For each science frame, this:
-- Applies correlated double sampling (CDS) and overscan correction
+- Collapses the ramp at each pixel (CDS or slope fitting)
+- Applies overscan correction and bad pixel correction
 - Median-combines the N closest-in-time sky frames for background subtraction
-- Corrects bad pixels using pre-computed neighbor interpolation
 - Extracts the spectral cube using the Cubifier's wavelength solution
 
 ```python
@@ -233,6 +259,23 @@ extractor = nales.CubeExtractor(
 
 extractor.run(output_dir='cubes/', n_sky_frames=50)
 ```
+
+To use slope fitting, set `method` and `read_stride` at construction:
+
+```python
+extractor = nales.CubeExtractor(
+    cubifier='science_target/Cubifier.pkl',
+    frame_ids='science_target/target_frames.pkl',
+    bad_pixel_file='wavecal/bad_and_neighbors_bpm_and_these_darks.pkl',
+    raw_directory='science_target/raw/',
+    method='slopes',
+    read_stride=1,  # Use every read
+)
+
+extractor.run(output_dir='cubes/', n_sky_frames=50)
+```
+
+The `method` and `read_stride` are set once at construction and apply consistently to `run()`, `preprocess_only()`, and `extract_single()`.
 
 Output:
 - `cubes/cube_*.fits` - Extracted spectral cubes with wavelength table
@@ -247,7 +290,7 @@ cube, wavelengths = cubifier(science_frame)
 
 #### Flexure Tracking
 
-For multiple calibrations per night, you can preprocess once and re-cubify with different Cubifiers. The preprocessing steps (CDS, sky subtraction, bad pixel correction) are saved, allowing re-extraction without repeating them:
+For multiple calibrations per night, you can preprocess once and re-cubify with different Cubifiers. The preprocessing steps (ramp collapse, sky subtraction, bad pixel correction) are saved, allowing re-extraction without repeating them:
 
 ```python
 # Preprocess once
@@ -275,6 +318,16 @@ Four narrow-band filters (NB29, NB33, NB35, NB39 at 2.9, 3.3, 3.5, 3.9 μm) prov
 ### Light Leak Correction
 
 ALES has a static light leak pattern contaminating calibration and sky frames. nales computes this as the median of all narrowband images and subtracts it automatically.
+
+### Ramp Collapse: CDS vs. Slope Fitting
+
+The ALES CMOS detector reads out non-destructively, producing a "ramp" of multiple reads per exposure. These reads must be collapsed into a single 2D image before cube extraction. nales supports two methods:
+
+- **CDS (Correlated Double Sampling):** Subtracts the first read from the last. This removes the reset pedestal and is fast, but only uses two of the available reads.
+
+- **Slope Fitting:** Fits a linear slope to all reads (or a strided subset) at each pixel. This uses all the information in the ramp, reducing read noise by approximately sqrt(N) where N is the number of reads. It also enables identification and rejection of cosmic ray hits as outliers from the fit. The output is scaled to CDS-equivalent units so that downstream calibration (extraction weights, wavelength solution, flux calibration) is unchanged.
+
+The `method` parameter controls this choice throughout the pipeline: in `organize_wavecal_frames()`, `SkyBuilder.build_median_sky()`, and `CubeExtractor`. When using slope fitting with `SkyBuilder` or `CubeExtractor`, the `read_stride` parameter controls which reads are loaded from disk. Read 0 (the reset read) is always included, and reads are selected as [0, stride, 2\*stride, ...]. A stride of 1 uses every read; a stride of 2 uses every other read, reducing memory at the cost of fewer points in the fit.
 
 ---
 
@@ -329,10 +382,18 @@ median_sky = builder.build_median_sky(
     bad_pixel_file,
     light_leak_file=None,
     light_leak_scale=1.0,
-    chunk_size=512,    # Must divide 2048 evenly; smaller = less memory
+    chunk_size=512,       # Must divide 2048 evenly; smaller = less memory
+    read_stride=-1,       # -1 loads only first/last reads; positive int for slopes
+    method='cds',         # 'cds' or 'slopes'
     output=None
 )
 ```
+
+**Parameters explained:**
+
+- **`read_stride`**: Controls which reads to load from each ramp. Default `-1` loads only the first and last reads (for CDS). When `method='slopes'`, must be set to a positive integer; reads are loaded as [0, stride, 2\*stride, ...]. Reduce `chunk_size` when using a small stride with many reads.
+
+- **`method`**: Ramp collapse method. `'cds'` (default) uses correlated double sampling. `'slopes'` fits a slope to all loaded reads. Requires `read_stride` to be set explicitly.
 
 ### CubeExtractor
 
@@ -341,13 +402,19 @@ extractor = nales.CubeExtractor(
     cubifier,          # Cubifier object or path to pickle
     frame_ids,         # SkyBuilder object or path to pickle with frame classifications
     bad_pixel_file,
-    raw_directory=None
+    raw_directory=None,
+    method='cds',      # 'cds' or 'slopes'
+    read_stride=-1,    # -1 for CDS; positive int required for slopes
 )
 
 extractor.run(output_dir, n_sky_frames=50)
 extractor.preprocess_only(output_dir, n_sky_frames=50)
 extractor.cubify_preprocessed(input_dir, output_dir)
 ```
+
+**Parameters explained:**
+
+- **`method`** and **`read_stride`**: Set at construction and applied consistently across `run()`, `preprocess_only()`, and `extract_single()`. See [Ramp Collapse: CDS vs. Slope Fitting](#ramp-collapse-cds-vs-slope-fitting) for details.
 
 ### Utility Modules
 
@@ -444,7 +511,7 @@ plt.ion()
 
 ### Memory Issues
 
-ALES produces large cubes. Ensure 16GB+ RAM and use `CubeExtractor` for batch processing with chunked memory management. For `SkyBuilder.build_median_sky()`, reduce `chunk_size` (e.g., 256 or 512) to limit memory usage.
+ALES produces large cubes. Ensure 16GB+ RAM and use `CubeExtractor` for batch processing with chunked memory management. For `SkyBuilder.build_median_sky()`, reduce `chunk_size` (e.g., 256 or 512) to limit memory usage. When using `method='slopes'`, memory per chunk scales with the number of reads loaded — use a smaller `chunk_size` or a larger `read_stride` to compensate.
 
 ---
 
