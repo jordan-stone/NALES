@@ -580,10 +580,15 @@ class CubeExtractor:
         
     def _save_cube(self, cube, wavelengths, header, primary_file, sky_files, output_path):
         """
-        Save cube with wavelength table extension and full metadata.
+        Save cube with WAVE-TAB WCS and wavelength table extension.
         
-        The wavelength solution is stored in a binary table extension
-        for precise wavelength information.
+        The wavelength axis uses the FITS Paper III ``-TAB`` lookup table
+        convention (``CTYPE3 = 'WAVE-TAB'``), which exactly represents the
+        non-linear prism dispersion. The authoritative wavelength values
+        are stored in a binary table extension named ``WAVELENGTH``, and
+        the WCS keywords in the primary header point to this table via
+        ``PS3_0`` / ``PS3_1``.  Individual slice wavelengths are also
+        recorded as ``SLICE###`` header keywords for quick access.
         """
         # Primary HDU with cube data
         primary_hdu = fits.PrimaryHDU(cube)
@@ -594,18 +599,24 @@ class CubeExtractor:
             if key in header:
                 primary_hdu.header[key] = header[key]
                 
-        # Add basic WCS-like keywords for wavelength axis
+        # WCS for wavelength axis using -TAB lookup table convention
+        # (FITS Paper III, Greisen et al. 2006). This exactly represents
+        # the non-linear wavelength solution derived from the prism
+        # dispersion model: wavelength = A * sqrt(pixel - B) + C
         primary_hdu.header['NAXIS3'] = len(wavelengths)
-        primary_hdu.header['CRPIX3'] = 1
-        primary_hdu.header['CRVAL3'] = float(wavelengths[0])
-        primary_hdu.header['CDELT3'] = float(wavelengths[1] - wavelengths[0])
-        primary_hdu.header['CTYPE3'] = 'WAVELENGTH'
-        primary_hdu.header['CUNIT3'] = 'micron'
+        primary_hdu.header['CTYPE3'] = ('WAVE-TAB', 'Wavelength via table lookup')
+        primary_hdu.header['CUNIT3'] = ('um', 'Wavelength unit (microns)')
+        primary_hdu.header['CRPIX3'] = (0.0, 'Reference pixel for TAB lookup')
+        primary_hdu.header['CRVAL3'] = (0.0, 'Coordinate value at reference pixel')
+        primary_hdu.header['CDELT3'] = (1.0, 'Index step for table lookup')
+        primary_hdu.header['PS3_0'] = ('WAVELENGTH', 'EXTNAME of lookup table')
+        primary_hdu.header['PS3_1'] = ('WAVELENGTH', 'Column name in lookup table')
         
-        # Also store wavelengths in header keywords (legacy format)
+        # Also store individual wavelengths as header keywords for
+        # quick access without reading the table extension
         for kk, wl in enumerate(wavelengths):
             primary_hdu.header[f'SLICE{kk:03d}'] = (
-                float(wl), 'wavelength microns'
+                float(wl), f'[um] wavelength of slice {kk}'
             )
             
         # Record provenance
@@ -613,16 +624,23 @@ class CubeExtractor:
             primary_hdu.header['COMMENT'] = f'primary file: {primary_file}'
         for sky_file in sky_files:
             primary_hdu.header['COMMENT'] = f'sky file: {sky_file}'
+        primary_hdu.header['COMMENT'] = ('Wavelength axis uses WAVE-TAB convention.'
+                                         ' Authoritative wavelengths are in the'
+                                         ' WAVELENGTH binary table extension.')
             
-        # Create wavelength table extension
+        # Create WAVE-TAB lookup table extension
+        # Per FITS Paper III, the coordinate array is stored as a
+        # single-row variable-length or fixed-length array column.
+        n_wave = len(wavelengths)
         wavelength_col = fits.Column(
             name='WAVELENGTH',
-            format='E',
-            unit='micron',
-            array=wavelengths
+            format=f'{n_wave}D',
+            unit='um',
+            array=wavelengths.reshape(1, -1)
         )
         wavelength_table = fits.BinTableHDU.from_columns([wavelength_col])
         wavelength_table.header['EXTNAME'] = 'WAVELENGTH'
+        wavelength_table.header['EXTVER'] = 1
         
         # Write multi-extension FITS
         hdu_list = fits.HDUList([primary_hdu, wavelength_table])

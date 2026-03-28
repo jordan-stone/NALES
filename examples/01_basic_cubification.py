@@ -93,12 +93,24 @@ def main():
     # Step 4: Save and visualize results
     # =========================================================================
     
-    # Save the cube with wavelength table extension
+    # Save the cube with WAVE-TAB WCS and wavelength table extension
     primary_hdu = fits.PrimaryHDU(cube)
     
-    # Add wavelength as binary table extension (preferred over WCS for non-linear solutions)
-    wl_col = fits.Column(name='WAVELENGTH', format='E', unit='um', array=wavelengths)
+    # WAVE-TAB WCS header keywords (FITS Paper III)
+    n_wave = len(wavelengths)
+    primary_hdu.header['CTYPE3'] = ('WAVE-TAB', 'Wavelength via table lookup')
+    primary_hdu.header['CUNIT3'] = ('um', 'Wavelength unit (microns)')
+    primary_hdu.header['CRPIX3'] = (0.0, 'Reference pixel for TAB lookup')
+    primary_hdu.header['CRVAL3'] = (0.0, 'Coordinate value at reference pixel')
+    primary_hdu.header['CDELT3'] = (1.0, 'Index step for table lookup')
+    primary_hdu.header['PS3_0'] = ('WAVELENGTH', 'EXTNAME of lookup table')
+    primary_hdu.header['PS3_1'] = ('WAVELENGTH', 'Column name in lookup table')
+    
+    # Wavelength lookup table as single-row array column
+    wl_col = fits.Column(name='WAVELENGTH', format=f'{n_wave}D', unit='um',
+                         array=wavelengths.reshape(1, -1))
     wl_table = fits.BinTableHDU.from_columns([wl_col], name='WAVELENGTH')
+    wl_table.header['EXTVER'] = 1
     
     hdul = fits.HDUList([primary_hdu, wl_table])
     hdul.writeto('output_cube.fits', overwrite=True)

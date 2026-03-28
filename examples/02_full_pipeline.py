@@ -299,7 +299,9 @@ def main():
         with fits.open(sample_file) as hdu:
             sample_cube = hdu[0].data
             if len(hdu) > 1 and hdu[1].name == 'WAVELENGTH':
-                wavelengths = hdu[1].data['WAVELENGTH']
+                wl_data = hdu[1].data['WAVELENGTH']
+                # WAVE-TAB stores wavelengths as a single-row array column
+                wavelengths = wl_data.flatten() if wl_data.ndim > 1 else wl_data
             else:
                 wavelengths = np.arange(sample_cube.shape[0])
         
